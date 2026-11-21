@@ -165,6 +165,75 @@ def touches_toplevel(f, lo, hi):
             return True
     return False
 
+
+_CLASSBODY_CACHE = {}
+
+def class_body_ranges(f):
+    if f in _CLASSBODY_CACHE:
+        return _CLASSBODY_CACHE[f]
+    ranges = []
+    try:
+        tree = ast.parse(repo_text(f) or "")
+    except Exception:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and hasattr(node, "end_lineno"):
+                inner = []
+                for sub in ast.walk(node):
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and hasattr(sub, "end_lineno"):
+                        inner.append((sub.lineno, sub.end_lineno))
+                ranges.append((node.lineno, node.end_lineno, inner))
+    _CLASSBODY_CACHE[f] = ranges
+    return ranges
+
+def in_class_body(f, lo, hi):
+    for cs, ce, inner in class_body_ranges(f):
+        olo, ohi = max(lo, cs), min(hi, ce)
+        if olo > ohi:
+            continue
+        covered = False
+        for s, e in inner:
+            if s <= ohi and e >= olo:
+                covered = True
+                break
+        if not covered:
+            return True
+    return False
+
+
+_FUNC_CACHE = {}
+
+def enclosing_function(f, lo, hi):
+    if f not in _FUNC_CACHE:
+        spans = []
+        try:
+            tree = ast.parse(repo_text(f) or "")
+        except Exception:
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and hasattr(node, "end_lineno"):
+                    spans.append((node.lineno, node.end_lineno))
+        _FUNC_CACHE[f] = spans
+    best = None
+    for s, e in _FUNC_CACHE[f]:
+        if s <= lo and e >= hi:
+            if best is None or (e - s) < (best[1] - best[0]):
+                best = (s, e)
+    return best
+
+FAMILY_DIRS = ("sqlglot/dialects/",)
+
+def family_tests(f):
+    # f is sqlglot/dialects/<name>.py: add tests covering sibling modules whose
+    # classes inherit this dialect's class attributes (line coverage cannot see them)
+    stem = Path(f).stem
+    out = set()
+    for d in ("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"):
+        out |= file_all_tests(d + stem + ".py")
+    return out
+
 def token_net(stems, tests):
     picked = set()
     pats = [re.compile(r"(?i)(?<![a-z0-9_])" + re.escape(s) + r"(?![a-z0-9_])") for s in stems]
@@ -174,7 +243,7 @@ def token_net(stems, tests):
             picked.add(t["number"])
     return picked
 
-def pack(tests_sel, maxw=8):
+def pack(tests_sel, maxw=8, all_tests=None):
     if not tests_sel:
         return []
     best = None
@@ -188,7 +257,20 @@ def pack(tests_sel, maxw=8):
         cost = max(ld) + 2 * w
         if best is None or cost < best[0]:
             best = (cost, [x for x in ws if x])
-    return best[1]
+    bins = best[1]
+    if all_tests:
+        chosen = {n for worker in bins for n in worker}
+        secs = {t["number"]: t["seconds"] for t in all_tests}
+        loads = [sum(secs[n] for n in worker) for worker in bins]
+        cap = max(loads)
+        for t in sorted((t for t in all_tests if t["number"] not in chosen),
+                        key=lambda x: (x["seconds"], x["number"])):
+            i = loads.index(min(loads))
+            if loads[i] + t["seconds"] > cap:
+                break
+            bins[i].append(t["number"])
+            loads[i] += t["seconds"]
+    return bins
 
 def select(patch_text, tests):
     entries = list(parse_patch(patch_text))
@@ -233,14 +315,23 @@ def select(patch_text, tests):
         if path not in LM:                # brand-new module: nothing can cover it
             continue
         for os_, oc in hunks:
-            lo, hi = (os_, os_ + oc - 1) if oc > 0 else (os_ - 2, os_ + 2)
+            lo, hi = (os_ - 2, os_ + oc + 1) if oc > 0 else (os_ - 2, os_ + 2)
             lo = max(lo, 1)
             if touches_toplevel(path, lo, hi):
                 picked |= file_all_tests(path)
+                if any(path.startswith(d) for d in FAMILY_DIRS) and in_class_body(path, lo, hi):
+                    picked |= family_tests(path)
             else:
                 got = line_tests(path, lo, hi)
                 if got:
                     picked |= got
+                span = enclosing_function(path, os_, max(os_, os_ + oc - 1))
+                if span is not None:
+                    fgot = line_tests(path, span[0], span[1])
+                    if fgot:
+                        picked |= fgot
+                if any(path.startswith(d) for d in FAMILY_DIRS) and in_class_body(path, lo, hi):
+                    picked |= family_tests(path)
     if src_touched and not picked:
         for new, old, hunks, body in entries:
             p = new if new != "/dev/null" else old
@@ -292,7 +383,7 @@ def main():
         probe()
     for patch in commits:
         sel = select(patch.read_text(errors="replace"), tests)
-        workers = pack(sel)
+        workers = pack(sel, all_tests=tests)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: selected {len(sel)} tests on {len(workers)} workers")
 
