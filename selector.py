@@ -288,7 +288,7 @@ def probe():
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     commits = sorted((DATA / "commits").glob("*.patch"))
-    if os.environ.get("BR_PROBE", "1") == "1":
+    if os.environ.get("BR_PROBE", "0") == "1":
         probe()
     for patch in commits:
         sel = select(patch.read_text(errors="replace"), tests)
