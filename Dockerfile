@@ -2,9 +2,13 @@
 # the image the organizers labeled every commit in (see the starter kit).
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
+# Test dependencies for the selector's optional self-checks (PyPI is an allowed
+# build-time source). sqlglot itself is installed from the pinned checkout below.
+RUN pip install --no-cache-dir pytest pytest-xdist pytest-subtests duckdb pytz python-dateutil
+
 # sqlglot's own repository at the pinned commit (allowed download at build time).
-# Kept pristine at /opt/repo for the selector's harmlessness (AST) checks and
-# fixture/text lookups at run time.
+# Kept pristine at /opt/repo for the selector's harmlessness (AST) checks,
+# fixture/text lookups and any decision-time test runs.
 RUN python - <<'PY'
 import tarfile, urllib.request, io, os, shutil
 url = "https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz"
@@ -18,6 +22,7 @@ RUN chmod -R a+rX /opt/repo
 
 COPY selector.py /app/selector.py
 COPY maps.json /app/maps.json
-RUN chmod a+r /app/selector.py /app/maps.json
+COPY linemap.json /app/linemap.json
+RUN chmod a+r /app/selector.py /app/maps.json /app/linemap.json
 
 CMD ["python", "/app/selector.py"]
