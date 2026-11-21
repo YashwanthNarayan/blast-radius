@@ -16,7 +16,7 @@ os.chmod("/opt/repo", 0o755)
 PY
 RUN chmod -R a+rX /opt/repo
 
-COPY coverage_selector/selector.py coverage_selector/measured.json.gz.b64 coverage_selector/values.json.gz.b64 coverage_selector/catalog.sha256 coverage_selector/registry.json coverage_selector/native.json.gz.b64 /app/
+COPY coverage_selector/selector.py coverage_selector/measured.json.gz.b64 coverage_selector/values.json.gz.b64 coverage_selector/catalog.sha256 coverage_selector/registry.json coverage_selector/native.json.gz.b64 linemap.json.gz /app/
 RUN python - <<'PYMAP'
 import base64
 from pathlib import Path
