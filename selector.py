@@ -10,13 +10,14 @@ Bundled:
   /opt/repo                  pristine sqlglot checkout at the pinned commit
 stdout: one JSON line per commit {"commit": id, "workers": [[...], ...]}
 """
-import ast, json, os, re, sys
+import ast, gzip, json, os, re, sys
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 REPO = Path(os.environ.get("BR_REPO", "/opt/repo"))
 MAPS = json.loads(Path(os.environ.get("BR_MAPS", "/app/maps.json")).read_text())
-LM = json.loads(Path(os.environ.get("BR_LM", "/app/linemap.json")).read_text())
+_lmp = Path(os.environ.get("BR_LM", "/app/linemap.json.gz"))
+LM = json.loads(gzip.decompress(_lmp.read_bytes()) if _lmp.suffix == ".gz" else _lmp.read_text())
 BYFILE = {k: v for k, v in MAPS["byfile"].items()}
 TEXT_CACHE = {}
 
