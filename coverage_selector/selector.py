@@ -249,6 +249,86 @@ def registration_clients(change, replacement):
     return clients
 
 
+
+
+# ----- H_fam addition: dialect class-body family net (from v7, linemap-derived) -----
+LM = json.loads(gzip.decompress((HERE / "linemap.json.gz").read_bytes()))
+
+
+def _file_all_tests(f):
+    e = LM.get(f)
+    if not e:
+        return set()
+    out = set()
+    for s in e["s"]:
+        out.update(s)
+    return out
+
+
+_CLASSBODY_CACHE = {}
+
+
+def _class_body_hit(f, lo, hi):
+    if f not in _CLASSBODY_CACHE:
+        ranges = []
+        try:
+            tree = ast.parse((ROOT / f).read_text(errors="replace"))
+        except Exception:
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and hasattr(node, "end_lineno"):
+                    inner = [
+                        (sub.lineno, sub.end_lineno)
+                        for sub in ast.walk(node)
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and hasattr(sub, "end_lineno")
+                    ]
+                    ranges.append((node.lineno, node.end_lineno, inner))
+        _CLASSBODY_CACHE[f] = ranges
+    for cs, ce, inner in _CLASSBODY_CACHE[f]:
+        olo, ohi = max(lo, cs), min(hi, ce)
+        if olo > ohi:
+            continue
+        if not any(s <= ohi and e >= olo for s, e in inner):
+            return True
+    return False
+
+
+def family_additions(raw):
+    """Tests covering same-stem sibling modules for class-body edits in dialects/*.py.
+
+    Dialect class attributes are read via inheritance in generators/parsers/typing
+    modules, so per-line attribution never credits the dialect file itself.
+    Fail-open: any error yields no additions (measured selection stands).
+    """
+    out = set()
+    try:
+        lines = raw.decode().split("\n")
+        path = None
+        i = 0
+        while i < len(lines):
+            m = HEADER.fullmatch(lines[i])
+            if m:
+                path = m.group(1)
+            elif path and path.startswith("sqlglot/dialects/"):
+                h = HUNK.fullmatch(lines[i])
+                if h:
+                    os_, oc = int(h.group(1)), int(h.group(2) or 1)
+                    lo, hi = (os_, os_ + oc - 1) if oc > 0 else (os_ - 2, os_ + 2)
+                    lo = max(lo, 1)
+                    if _class_body_hit(path, lo, hi):
+                        stem = Path(path).stem
+                        for d in ("sqlglot/dialects/", "sqlglot/generators/",
+                                  "sqlglot/parsers/", "sqlglot/typing/"):
+                            out |= _file_all_tests(d + stem + ".py")
+            i += 1
+    except Exception as e:
+        print("family net skipped:", repr(e), file=__import__("sys").stderr)
+        return set()
+    return out
+
+
 def select_file(path, patched):
     readers = hits("read", path)
     if path.startswith("tests/fixtures/") and readers:
@@ -382,8 +462,10 @@ def main():
             require(catalog_matches)
             changed = list(changes(patch.read_bytes()))
             require(changed)
+            raw = patch.read_bytes()
             for path, _, patched in changed:
                 picked.update(select_file(path, patched))
+            picked.update(family_additions(raw))
         except (
             ValueError,
             SyntaxError,
