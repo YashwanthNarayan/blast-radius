@@ -249,6 +249,66 @@ def registration_clients(change, replacement):
     return clients
 
 
+
+
+# ----- H_base addition: exact-hunk-line linemap differential -----
+LM = json.loads(gzip.decompress((HERE / "linemap.json.gz").read_bytes()))
+
+
+def _line_tests(f, lo, hi):
+    e = LM.get(f)
+    if not e:
+        return set()
+    out = set()
+    for s, ee, sid in e["r"]:
+        if ee < lo:
+            continue
+        if s > hi:
+            break
+        out.update(e["s"][sid])
+    return out
+
+
+def base_additions(raw):
+    """Coverage-linemap tests for exactly the REMOVED old-side lines of sqlglot/*.py
+    edits - context lines excluded, no widening, no family/function-span nets, no
+    toplevel escalation. Pure insertions (including comment-only edits) add nothing.
+    Tests the hypothesis that coverage-derived line attribution credits tests the
+    replay-derived maps lack. Fail-open: errors yield no additions."""
+    out = set()
+    try:
+        lines = raw.decode().split("\n")
+        path = None
+        old_lineno = None
+        in_hunk = False
+        for line in lines:
+            m = HEADER.fullmatch(line)
+            if m:
+                path = m.group(1)
+                in_hunk = False
+                continue
+            h = HUNK.fullmatch(line)
+            if h:
+                old_lineno = int(h.group(1))
+                in_hunk = True
+                continue
+            if not in_hunk or not path or not path.startswith("sqlglot/") or not path.endswith(".py"):
+                continue
+            if line.startswith("-"):
+                out |= _line_tests(path, old_lineno, old_lineno)
+                old_lineno += 1
+            elif line.startswith("+"):
+                pass
+            elif line.startswith(" ") or line == "":
+                old_lineno += 1
+            else:
+                in_hunk = False
+    except Exception as e:
+        print("base additions skipped:", repr(e), file=__import__("sys").stderr)
+        return set()
+    return out
+
+
 def select_file(path, patched):
     readers = hits("read", path)
     if path.startswith("tests/fixtures/") and readers:
@@ -382,8 +442,11 @@ def main():
             require(catalog_matches)
             changed = list(changes(patch.read_bytes()))
             require(changed)
+            raw = patch.read_bytes()
             for path, _, patched in changed:
                 picked.update(select_file(path, patched))
+            if picked:
+                picked.update(base_additions(raw))
         except (
             ValueError,
             SyntaxError,
