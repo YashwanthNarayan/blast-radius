@@ -24,7 +24,7 @@ RUN chmod -R a+rX /opt/repo
 
 COPY selector.py /app/selector.py
 COPY maps.json /app/maps.json
-COPY linemap.json /app/linemap.json
-RUN chmod a+r /app/selector.py /app/maps.json /app/linemap.json
+COPY linemap.json.gz /app/linemap.json.gz
+RUN chmod a+r /app/selector.py /app/maps.json /app/linemap.json.gz
 
 CMD ["python", "/app/selector.py"]
