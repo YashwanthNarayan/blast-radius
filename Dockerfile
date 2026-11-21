@@ -4,7 +4,9 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 
 # Test dependencies for the selector's optional self-checks (PyPI is an allowed
 # build-time source). sqlglot itself is installed from the pinned checkout below.
-RUN pip install --no-cache-dir pytest pytest-xdist pytest-subtests duckdb pytz python-dateutil
+# Versions pinned to the starter kit's requirements.lock (the labeling environment).
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir pytest==9.2.0 pytest-xdist==3.8.0 pytest-timeout==2.4.0 duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 pytz==2026.6 python-dateutil==4.0.0 PyYAML==6.0.3
 
 # sqlglot's own repository at the pinned commit (allowed download at build time).
 # Kept pristine at /opt/repo for the selector's harmlessness (AST) checks,
