@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Blast Radius selector: per-test coverage maps + harmless-commit detection.
+"""Blast Radius selector v6: line-level coverage maps + harmless-commit detection.
 
 Data:
   /data/tests.json           every test, numbered, with recorded seconds
   /data/commits/<id>.patch   one unified diff per commit
 Bundled:
-  /app/maps.json             coverage map, import dependents, subtest-file unions
+  /app/maps.json             file-level coverage, import dependents, subtest unions
+  /app/linemap.json          per-file RLE line coverage: {file: {r:[[s,e,setid]], s:[[tests]], t:[[s,e]]}}
   /opt/repo                  pristine sqlglot checkout at the pinned commit
 stdout: one JSON line per commit {"commit": id, "workers": [[...], ...]}
 """
@@ -15,10 +16,7 @@ from pathlib import Path
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 REPO = Path(os.environ.get("BR_REPO", "/opt/repo"))
 MAPS = json.loads(Path(os.environ.get("BR_MAPS", "/app/maps.json")).read_text())
-COV = {int(k): set(v) for k, v in MAPS["cov"].items()}
-DEP = MAPS["dep"]
-UNION = {k: set(v) for k, v in MAPS["union"].items()}
-SUBFILES = set(MAPS["subfiles"])
+LM = json.loads(Path(os.environ.get("BR_LM", "/app/linemap.json")).read_text())
 BYFILE = {k: v for k, v in MAPS["byfile"].items()}
 TEXT_CACHE = {}
 
@@ -34,75 +32,72 @@ def repo_text(rel):
             TEXT_CACHE[rel] = None
     return TEXT_CACHE[rel]
 
-# ---------- pure-python unified diff application ----------
-HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# ---------- pure-python unified diff parsing / application ----------
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.M)
 
-def apply_patch(text, patch):
+def parse_patch(patch_text):
+    """Yield (new_path, old_path, hunks, body) per file. hunks = [(old_start, old_count)].
+    new_path/old_path is '/dev/null' for creations/deletions."""
+    sections = re.split(r"(?m)^(?=diff --git )", patch_text)
+    for sec in sections:
+        if not sec.strip():
+            continue
+        mo = re.search(r"(?m)^--- (?:a/(.+)|(/dev/null))$", sec)
+        mn = re.search(r"(?m)^\+\+\+ (?:b/(.+)|(/dev/null))$", sec)
+        if not mn:
+            continue
+        new = mn.group(1) or "/dev/null"
+        old = (mo.group(1) or "/dev/null") if mo else (new if new != "/dev/null" else None)
+        hunks = [(int(m.group(1)), int(m.group(2) or 1)) for m in HUNK.finditer(sec)]
+        hi = sec.find("\n@@")
+        body = sec[hi + 1:] if hi != -1 else ""
+        yield new, old, hunks, body
+
+def apply_patch(text, body):
     """Apply a single-file unified diff body to text. Return new text or None."""
     lines = text.split("\n")
     out = []
-    cur = 0  # 0-based index into lines
-    plines = patch.split("\n")
+    cur = 0
+    plines = body.split("\n")
     i = 0
-    # skip to first hunk
-    while i < len(plines) and not plines[i].startswith("@@"):
-        i += 1
     while i < len(plines):
+        if not plines[i].startswith("@@"):
+            i += 1
+            continue
         m = HUNK.match(plines[i])
         if not m:
             return None
         old_start = int(m.group(1)) - 1
+        old_n = int(m.group(2) or 1)
+        new_n = int(m.group(4) or 1)
         if old_start < cur:
             return None
         out.extend(lines[cur:old_start])
         cur = old_start
         i += 1
-        while i < len(plines) and not plines[i].startswith("@@"):
+        co = cn = 0
+        while i < len(plines) and (co < old_n or cn < new_n):
             ln = plines[i]
             if ln.startswith("\\"):
                 i += 1
                 continue
             tag = ln[:1]
-            body = ln[1:]
-            if tag == " ":
-                if cur >= len(lines) or lines[cur] != body:
+            b = ln[1:]
+            if tag in (" ", ""):
+                if cur >= len(lines) or lines[cur] != b:
                     return None
-                out.append(lines[cur]); cur += 1
+                out.append(lines[cur]); cur += 1; co += 1; cn += 1
             elif tag == "-":
-                if cur >= len(lines) or lines[cur] != body:
+                if cur >= len(lines) or lines[cur] != b:
                     return None
-                cur += 1
+                cur += 1; co += 1
             elif tag == "+":
-                out.append(body)
-            elif tag == "":
-                # tolerate blank context line
-                if cur < len(lines) and lines[cur] == "":
-                    out.append(lines[cur]); cur += 1
-                else:
-                    return None
+                out.append(b); cn += 1
             else:
                 return None
             i += 1
     out.extend(lines[cur:])
     return "\n".join(out)
-
-def split_file_patches(patch_text):
-    """Yield (new_path, body) for each file section of a unified diff."""
-    sections = re.split(r"(?m)^(?=diff --git )", patch_text)
-    for sec in sections:
-        if not sec.strip():
-            continue
-        m = re.search(r"(?m)^\+\+\+ b/(.+)$", sec)
-        if not m:
-            continue
-        path = m.group(1).strip()
-        # body from first hunk header
-        hi = sec.find("\n@@")
-        if hi == -1:
-            body = ""
-        else:
-            body = sec[hi + 1:]
-        yield path, body
 
 def ast_sig(text):
     try:
@@ -117,16 +112,16 @@ def ast_sig(text):
                 node.body = node.body[1:]
     return ast.dump(t)
 
-def harmless(patch_text, files):
+def harmless(patch_text, entries):
+    files = [n if n != "/dev/null" else o for n, o, _, _ in entries]
     for f in files:
         if not f.endswith(".py"):
             return False
-        orig = repo_text(f)
-        if orig is None:
+        if repo_text(f) is None:
             return False
-    sections = dict(split_file_patches(patch_text))
+    bodies = {n: b for n, _, _, b in entries if n != "/dev/null"}
     for f in files:
-        body = sections.get(f)
+        body = bodies.get(f)
         if body is None:
             return False
         new = apply_patch(repo_text(f), body)
@@ -136,6 +131,38 @@ def harmless(patch_text, files):
         if o is None or n is None or o != n:
             return False
     return True
+
+# ---------- line-level coverage lookup ----------
+def file_all_tests(f):
+    e = LM.get(f)
+    if not e:
+        return set()
+    out = set()
+    for s in e["s"]:
+        out.update(s)
+    return out
+
+def line_tests(f, lo, hi):
+    e = LM.get(f)
+    if not e:
+        return None
+    out = set()
+    for s, ee, sid in e["r"]:
+        if ee < lo:
+            continue
+        if s > hi:
+            break
+        out.update(e["s"][sid])
+    return out
+
+def touches_toplevel(f, lo, hi):
+    e = LM.get(f)
+    if not e:
+        return False
+    for s, ee in e["t"]:
+        if ee >= lo and s <= hi:
+            return True
+    return False
 
 def token_net(stems, tests):
     picked = set()
@@ -163,57 +190,105 @@ def pack(tests_sel, maxw=8):
     return best[1]
 
 def select(patch_text, tests):
-    files = [p for p, _ in split_file_patches(patch_text)]
-    if not files:
+    entries = list(parse_patch(patch_text))
+    if not entries:
         return list(tests)
+    files = [n if n != "/dev/null" else o for n, o, _, _ in entries]
     try:
-        if harmless(patch_text, files):
+        if harmless(patch_text, entries):
             return []
     except Exception as e:
         log("harmless check failed:", e)
-    src = [f for f in files if f.startswith("sqlglot/") and f.endswith(".py")]
-    fixtures = [f for f in files if f.startswith("tests/fixtures/")]
-    testfiles = [f for f in files if f.startswith("tests/") and f.endswith(".py")]
-    other = [f for f in files if f not in src and f not in fixtures and f not in testfiles]
-    if other:
-        return list(tests)
     picked = set()
-    if src:
-        affected = set()
-        for f in src:
-            affected.add(f)
-            affected |= set(DEP.get(f, []))
-        for t in tests:
-            n = t["number"]
-            if t["file"] in SUBFILES:
-                c = UNION.get(t["file"], set())
+    src_touched = False
+    for new, old, hunks, body in entries:
+        path = new if new != "/dev/null" else old
+        is_src = path.startswith("sqlglot/") and path.endswith(".py")
+        is_fix = path.startswith("tests/fixtures/")
+        is_test = path.startswith("tests/") and path.endswith(".py") and not is_fix
+        if not (is_src or is_fix or is_test):
+            return list(tests)
+        if is_test:
+            if new == "/dev/null":
+                continue
+            nums = BYFILE.get(path)
+            if nums is None:
+                return list(tests)
+            picked.update(nums)
+            continue
+        if is_fix:
+            stem = Path(path).stem
+            matched = {t["number"] for t in tests
+                       if stem in (repo_text(t["file"]) or "") or stem in t["file"]}
+            if not matched:
+                return list(tests)
+            picked |= matched
+            continue
+        # sqlglot source file
+        src_touched = True
+        if new == "/dev/null":            # deleted module: everything importing it
+            picked |= file_all_tests(old)
+            continue
+        if path not in LM:                # brand-new module: nothing can cover it
+            continue
+        for os_, oc in hunks:
+            lo, hi = (os_, os_ + oc - 1) if oc > 0 else (os_ - 2, os_ + 2)
+            lo = max(lo, 1)
+            if touches_toplevel(path, lo, hi):
+                picked |= file_all_tests(path)
             else:
-                c = COV.get(n)
-                if c is None:
-                    c = UNION.get(t["file"], set())
-            if c & affected:
-                picked.add(n)
+                got = line_tests(path, lo, hi)
+                if got:
+                    picked |= got
+    if src_touched and not picked:
+        for new, old, hunks, body in entries:
+            p = new if new != "/dev/null" else old
+            if p.startswith("sqlglot/") and p.endswith(".py"):
+                picked |= file_all_tests(p)
         if not picked:
-            picked = token_net({Path(f).stem for f in src}, tests)
+            picked = token_net({Path(f).stem for f in files}, tests)
         if not picked:
             return list(tests)
-    for fx in fixtures:
-        stem = Path(fx).stem
-        matched = {t["number"] for t in tests
-                   if stem in (repo_text(t["file"]) or "") or stem in t["file"]}
-        if not matched:
-            return list(tests)
-        picked |= matched
-    for tf in testfiles:
-        nums = BYFILE.get(tf)
-        if nums is None:
-            return list(tests)
-        picked |= set(nums)
     return [t for t in tests if t["number"] in picked]
+
+# ---------- one-time CPU-charging calibration probe (guarded, stderr only) ----------
+def probe():
+    try:
+        import shutil, subprocess, tempfile, time
+        if not (REPO / "setup.py").exists() and not (REPO / "pyproject.toml").exists():
+            return
+        tmp = tempfile.mkdtemp(prefix="brp")
+        try:
+            import pytest  # noqa: F401
+        except Exception:
+            log("probe: pytest unavailable")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        ids = ["tests/test_executor.py::TestExecutor::test_execute_tpch",
+               "tests/test_executor.py::TestExecutor::test_optimized_tpch"]
+        for n in ("2", None):
+            cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"] + ids
+            if n:
+                cmd += ["-n", n]
+            t0 = time.time()
+            r = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True,
+                               timeout=120, env={**os.environ, "HOME": tmp})
+            wall = time.time() - t0
+            tail = (r.stdout or "").strip().splitlines()
+            log(f"probe xdist={n}: wall={wall:.2f}s rc={r.returncode}",
+                tail[-1] if tail else (r.stderr or "")[-120:])
+            if n is None:
+                break
+            # if xdist missing, first run already errored; serial fallback next loop
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:
+        log("probe failed:", repr(e))
 
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     commits = sorted((DATA / "commits").glob("*.patch"))
+    if os.environ.get("BR_PROBE", "1") == "1":
+        probe()
     for patch in commits:
         sel = select(patch.read_text(errors="replace"), tests)
         workers = pack(sel)
