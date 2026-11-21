@@ -21,6 +21,12 @@ GROUPS, ENTRIES, COMPLETE = json.loads(gzip.decompress(MAP.read_bytes()))
 DEPS = {tuple(row[:-1]): GROUPS[row[-1]] for row in ENTRIES}
 
 
+NATIVE = json.loads(gzip.decompress((HERE / "native.json.gz").read_bytes()))
+CHILD_LINES = {
+    (path, line): NATIVE["groups"][group] for path, line, group in NATIVE["rows"]
+}
+
+
 def hits(*key):
     return set(DEPS.get(key, ()))
 
@@ -217,6 +223,32 @@ def scopes(code):
     )
 
 
+@functools.lru_cache(1)
+def registry():
+    return json.loads((HERE / "registry.json").read_bytes())
+
+
+def registration_clients(change, replacement):
+    """Include base dispatch targets displaced by edited SQL aliases."""
+    if not isinstance(change, ast.Constant) or not isinstance(
+        replacement, ast.Constant
+    ):
+        raise ValueError("registry shape changed")
+    names = (change.value, replacement.value)
+    if not all(isinstance(name, str) for name in names):
+        raise ValueError("unknown registry key")
+    clients = set()
+    for name in names:
+        target = registry().get(name)
+        if target is None:
+            raise ValueError("previously unregistered spelling")
+        observed = hits("type", *target)
+        if not observed:
+            raise ValueError("unobserved dispatch target")
+        clients.update(observed)
+    return clients
+
+
 def select_file(path, patched):
     readers = hits("read", path)
     if path.startswith("tests/fixtures/") and readers:
@@ -237,6 +269,13 @@ def select_file(path, patched):
         compared = operand_hits(path, node, replacement)
         if compared is not None:
             result.update(compared)
+            # A child can execute a comparison absent from the replay. Preserve
+            # its reader when we lack an operand observation for that test.
+            observed = set().union(
+                *VALUE_DEPS[path, node.lineno, node.col_offset].values()
+            )
+            for line in range(node.lineno, node.end_lineno + 1):
+                result.update(set(CHILD_LINES.get((path, line), ())) - observed)
             continue
         chain = [node]
         while chain[-1] in parents:
@@ -271,15 +310,16 @@ def select_file(path, patched):
                 reversed([x.name for x in chain if isinstance(x, ast.ClassDef)])
             )
             relevant = hits("type", path[:-3].replace("/", "."), cls)
-            if not relevant and not any(
-                isinstance(x, ast.Name) and x.id in {"Expression", "Func"}
-                for x in owner.bases
-            ):
+            if not relevant:
                 raise ValueError
+            if target.id == "_sql_names":
+                relevant.update(registration_clients(node, replacement))
             if isinstance(assignment.value, (ast.Constant, ast.UnaryOp)):
                 at, direct = attribute_sites(target.id)
                 if at is not None:
                     relevant = (relevant & at) | direct
+            if not relevant:
+                raise ValueError
             result.update(relevant)
         else:
             if loc is None or loc is owner and not isinstance(owner, ast.Lambda):
@@ -291,6 +331,7 @@ def select_file(path, patched):
             # Use the position of the enclosing expression for operator-only edits.
             for line in range(loc.lineno, loc.end_lineno + 1):
                 result.update(hits("line", path, line))
+                result.update(CHILD_LINES.get((path, line), ()))
     return result
 
 
@@ -336,7 +377,7 @@ def main():
         BYFILE[t["file"]].add(t["number"])
     catalog_matches = signature == (HERE / "catalog.sha256").read_text().strip()
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        picked = missing.copy()
+        picked = missing.union(NATIVE["always"])
         try:
             require(catalog_matches)
             changed = list(changes(patch.read_bytes()))
