@@ -231,11 +231,15 @@ def select_file(path, patched):
         == scopes(compile(tree, path, "exec", dont_inherit=True))
     )
     result = readers.copy()
+    attributed = 0
+    changes_found = 0
     for node, replacement in changed_nodes(tree, new):
         if not isinstance(node, ast.expr) or not isinstance(replacement, ast.expr):
             raise ValueError
+        changes_found += 1
+        before = len(result)
         compared = operand_hits(path, node, replacement)
-        if compared is not None:
+        if compared:
             result.update(compared)
             continue
         chain = [node]
@@ -271,15 +275,14 @@ def select_file(path, patched):
                 reversed([x.name for x in chain if isinstance(x, ast.ClassDef)])
             )
             relevant = hits("type", path[:-3].replace("/", "."), cls)
-            if not relevant and not any(
-                isinstance(x, ast.Name) and x.id in {"Expression", "Func"}
-                for x in owner.bases
-            ):
+            if not relevant:
                 raise ValueError
             if isinstance(assignment.value, (ast.Constant, ast.UnaryOp)):
                 at, direct = attribute_sites(target.id)
                 if at is not None:
-                    relevant = (relevant & at) | direct
+                    relevant = relevant | at | direct
+                else:
+                    relevant = relevant | direct
             result.update(relevant)
         else:
             if loc is None or loc is owner and not isinstance(owner, ast.Lambda):
@@ -288,9 +291,15 @@ def select_file(path, patched):
                 x in owner.body for x in chain
             ):
                 raise ValueError
-            # Use the position of the enclosing expression for operator-only edits.
-            for line in range(loc.lineno, loc.end_lineno + 1):
+            # Use the enclosing function/lambda span; an expression's effect is
+            # not limited to the paths that executed its own lines on base.
+            span = owner if hasattr(owner, "end_lineno") else loc
+            for line in range(span.lineno, span.end_lineno + 1):
                 result.update(hits("line", path, line))
+        if len(result) > before:
+            attributed += 1
+    if changes_found and not attributed:
+        raise ValueError
     return result
 
 
