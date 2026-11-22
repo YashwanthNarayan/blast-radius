@@ -249,7 +249,66 @@ def registration_clients(change, replacement):
     return clients
 
 
-def select_file(path, patched):
+@functools.lru_cache(1)
+def key_map():
+    data = json.loads((HERE / "key_reads.json").read_bytes())
+    require(data["signature"] == (HERE / "catalog.sha256").read_text().strip())
+    return data
+
+
+def table_readers(path, attribute, assignment, chain, node, replacement):
+    """Narrow an existing value edit only when the producer is side-effect free."""
+    if attribute not in {"NUMERIC_ESCAPES", "SHOW_PARSERS"}:
+        return None
+    table = assignment.value
+    if not isinstance(table, ast.Dict):
+        return None
+    # A literal entry after the last unpack overrides all copied entries.
+    # If a later unpack can override this value, retain the v2 selection.
+    for index, value in enumerate(table.values):
+        if value in chain:
+            break
+    else:
+        return None
+    key_node = table.keys[index]
+    if not isinstance(key_node, ast.Constant) or type(key_node.value) is not str:
+        return None
+    key = key_node.value
+    for later in table.keys[index + 1 :]:
+        if not isinstance(later, ast.Constant) or later.value == key:
+            return None
+    if not isinstance(node, ast.Constant) or not isinstance(replacement, ast.Constant):
+        return None
+    if type(node.value) is not type(replacement.value):
+        return None
+    if attribute == "NUMERIC_ESCAPES":
+        if not (
+            isinstance(value, ast.Tuple)
+            and len(value.elts) == 4
+            and node in value.elts
+            and type(node.value) is int
+        ):
+            return None
+    elif not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "_show_parser"
+        and type(node.value) in (bool, str)
+        and (node in value.args or any(kw.value is node for kw in value.keywords))
+    ):
+        return None
+    data = key_map()
+    # Optimize only tables with positively observed reads on the base suite.
+    if attribute not in data["reads"].get(path, {}):
+        return None
+    picked = set(data["unknown"])
+    for owner in (path, "*"):
+        picked.update(data["reads"].get(owner, {}).get(attribute, {}).get(key, []))
+    require(-1 not in picked)
+    return picked
+
+
+def select_file(path, patched, *, use_keys=True):
     readers = hits("read", path)
     if path.startswith("tests/fixtures/") and readers:
         return readers
@@ -263,7 +322,8 @@ def select_file(path, patched):
         == scopes(compile(tree, path, "exec", dont_inherit=True))
     )
     result = readers.copy()
-    for node, replacement in changed_nodes(tree, new):
+    edits = changed_nodes(tree, new)
+    for node, replacement in edits:
         if not isinstance(node, ast.expr) or not isinstance(replacement, ast.expr):
             raise ValueError
         compared = operand_hits(path, node, replacement)
@@ -309,6 +369,13 @@ def select_file(path, patched):
             cls = ".".join(
                 reversed([x.name for x in chain if isinstance(x, ast.ClassDef)])
             )
+            if use_keys and len(edits) == 1:
+                keyed = table_readers(
+                    path, target.id, assignment, chain, node, replacement
+                )
+                if keyed is not None:
+                    result.update(keyed)
+                    continue
             relevant = hits("type", path[:-3].replace("/", "."), cls)
             if not relevant:
                 raise ValueError
@@ -383,7 +450,7 @@ def main():
             changed = list(changes(patch.read_bytes()))
             require(changed)
             for path, _, patched in changed:
-                picked.update(select_file(path, patched))
+                picked.update(select_file(path, patched, use_keys=len(changed) == 1))
         except (
             ValueError,
             SyntaxError,

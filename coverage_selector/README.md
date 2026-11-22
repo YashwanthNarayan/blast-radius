@@ -41,3 +41,15 @@ Use an empty child output directory for each rebuild. Keep the environment's Pyt
 ## Run
 
 Use the starter's make sample workflow with this repository as the Docker build context, or decode each .gz.b64 file alongside selector.py, set BR_REPO and BR_DATA, and run python coverage_selector/selector.py. BR_DATA should contain tests.json and commits/. Pass stdout to the official score.py. Competition CPU time is machine-dependent.
+
+## Value reads in tokenizer and SHOW parser tables
+
+The selector can narrow a single literal value edit in a numeric escape tuple or a SHOW parser factory call. The pinned tokenizer passes the numeric table into its scanner, where two lookups consume tuple values. Generator and metaclass checks use table membership and truthiness. For SHOW statements the trie is derived from keys and the parser reads a callable at dispatch. The collector attributes inherited tables by identity and copied handlers by callable identity. Unresolved origins contribute to every table for that attribute and key.
+
+Changing the keys can change a derived trie or the metaclass's behavior. These edits retain v2’s class-level selection and fallbacks. The same applies to multi-file edits, unsupported value computations and unobserved table owners. Observed source-file readers remain included. The map describes observations on the pinned checkout and is empirical.
+
+To regenerate, use the same BR_REPO, BR_TESTS, PATH and test environment as the other native collectors. From coverage_selector run:
+
+    python keytrace/collect.py key_reads.json
+
+The build copies the precomputed JSON. Collectors and mutation outcomes are outside the image.

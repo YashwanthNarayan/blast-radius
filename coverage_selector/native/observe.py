@@ -15,6 +15,7 @@ ids = {t["id"]: t["number"] for t in catalog}
 current = None
 uses = defaultdict(set)
 counts = defaultdict(int)
+completed = set()
 real_submit = futures.ProcessPoolExecutor.submit
 private = {}
 
@@ -51,6 +52,10 @@ def audit(event, args):
 
 
 class Tracker:
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call" and report.passed and report.nodeid in ids:
+            completed.add(ids[report.nodeid])
+
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(self, item, nextitem):
         global current
@@ -81,6 +86,7 @@ if __name__ == "__main__":
             {
                 "uses": {k: sorted(v) for k, v in uses.items()},
                 "submitted": counts,
+                "completed": sorted(completed),
                 "rc": int(rc),
             }
         )
